@@ -11,7 +11,6 @@ from os import path
 from pathlib import Path
 
 # 导入数据类型
-from pydoc import doc
 from sre_compile import CATEGORY
 from dataclasses import dataclass, field
 from typing import ClassVar, cast
@@ -161,7 +160,7 @@ class DataPreparationModule:
                 "没有加载的文档可供分块,请先调用 load_documents 方法加载文档"
             )
         chunks = self._markdown_header_split()
-        for i,chunk in enumerate(chunks):
+        for i, chunk in enumerate(chunks):
             metadata = cast(dict[str, object], chunk.metadata)
             if "chunk_id" not in metadata:
                 # 如果没有chunk_id,说明这个chunk是分块失败的文档,我们为它生成一个唯一的chunk_id,并且parent_id指向自己
@@ -234,13 +233,138 @@ class DataPreparationModule:
 
                     # 更新父子映射表,后续检索到子块后可回溯父文档
                     self.parent_child_map[chunk_id] = parent_id
-                    all_chunks.extend(md_chunks)
+                    all_chunks.append(chunk)
             except Exception:
                 # 如果分块过程中发生错误,记录日志并将整个文档作为一个chunk保留,避免丢失数据
                 logger.error(f"文档分块失败: {metadata.get('source', '未知')}")
                 all_chunks.append(document)
         return all_chunks
 
+    def filter_documents_by_category(self, category: str) -> list[Document]:
+        """
+        根据菜谱分类过滤文档
+        args:
+            category: str - 需要过滤的菜谱分类标签
+        returns:
+            过滤后的文档列表
+        """
+        if category not in self.CATEGORY_LABELS:
+            raise ValueError(f"无效的分类标签: {category}, 可选标签: {self.CATEGORY_LABELS}")
+        filtered_docs = [
+            doc
+            for doc in self.documents
+            if cast(dict[str, object], doc.metadata).get("category") == category
+        ]
+        logger.info(f"根据分类 '{category}' 过滤后得到 {len(filtered_docs)} 个文档")
+        return filtered_docs
+
+    def filter_documents_by_difficulty(self, difficulty: str) -> list[Document]:
+        """
+        根据菜谱难度等级过滤文档
+        args:
+            difficulty: str - 需要过滤的菜谱难度等级标签
+        returns:
+            过滤后的文档列表
+        """
+        if difficulty not in self.DIFFICULTY_LEVELS:
+            raise ValueError(
+                f"无效的难度等级标签: {difficulty}, 可选标签: {self.DIFFICULTY_LEVELS}"
+            )
+        filtered_docs = [
+            doc
+            for doc in self.documents
+            if cast(dict[str, object], doc.metadata).get("difficulty") == difficulty
+        ]
+        logger.info(f"根据难度等级 '{difficulty}' 过滤后得到 {len(filtered_docs)} 个文档")
+        return filtered_docs
+
+    def get_statistics(self) -> dict[str, object]:
+        """
+        获取数据集的统计信息
+        returns:
+            数据集统计信息字典
+        """
+        if not self.documents:
+            raise ValueError("没有加载的文档可供统计,请先调用 load_documents 方法加载文档")
+        categories = {}
+        difficulties = {}
+        for doc in self.documents:
+            metadata = cast(dict[str, object], doc.metadata)
+            category = metadata.get("category", "未知")
+            difficulty = metadata.get("difficulty", "未知")
+            categories[category] = categories.get(category, 0) + 1
+            difficulties[difficulty] = difficulties.get(difficulty, 0) + 1
+        return {
+            "total_documents": len(self.documents),
+            "total_chunks": len(self.chunks),
+            "categories": categories,
+            "difficulties": difficulties,
+            "avg_chunk_size": sum(len(chunk.page_content) for chunk in self.chunks) / len(self.chunks) if self.chunks else 0
+        }
+    def export_metadata(self, output_path: str) -> None:
+        """
+        导出文档的元数据到指定路径的JSON文件
+        args:
+            output_path: str - 导出文件的路径
+        """
+        import json
+
+        if not self.documents:
+            raise ValueError("没有加载的文档可供导出,请先调用 load_documents 方法加载文档")
+        metadata_list = []
+        for doc in self.documents:
+            metadata = cast(dict[str, object], doc.metadata)
+            metadata_list.append(metadata)
+        with open(output_path, "w", encoding="utf-8") as f:
+            json.dump(metadata_list, f, ensure_ascii=False, indent=4)
+        logger.info(f"成功导出 {len(metadata_list)} 条文档元数据到 {output_path}")
+    def get_parent_document(self, child_chunks: list[Document]) -> list[Document]:
+        """
+        根据检索到的子文档列表获取对应的父文档列表。
+
+        多个子文档可能来自同一个父文档。这里会统计每个父文档被命中的次数，
+        命中次数越多，说明这个父文档和查询越相关，返回时就排得越靠前。
+
+        args:
+            child_chunks: list[Document] - 检索得到的子文档列表
+        returns:
+            按相关性排序后的父文档列表
+        """
+        parent_relevance: dict[str, int] = {}
+        parent_docs_map: dict[str, Document] = {}
+
+        for child_chunk in child_chunks:
+            child_metadata = cast(dict[str, object], child_chunk.metadata)
+            parent_id_value = child_metadata.get("parent_id")
+            if not parent_id_value:
+                logger.warning("子文档缺少 parent_id, 已跳过")
+                continue
+
+            parent_id = str(parent_id_value)
+            parent_relevance[parent_id] = parent_relevance.get(parent_id, 0) + 1
+
+            if parent_id not in parent_docs_map:
+                for doc in self.documents:
+                    metadata = cast(dict[str, object], doc.metadata)
+                    if metadata.get("parent_id") == parent_id:
+                        parent_docs_map[parent_id] = doc
+                        break
+
+        sorted_parent_ids = sorted(
+            parent_relevance.keys(),
+            key=lambda parent_id: parent_relevance[parent_id],
+            reverse=True,
+        )
+
+        parent_docs: list[Document] = []
+        for parent_id in sorted_parent_ids:
+            if parent_id in parent_docs_map:
+                parent_docs.append(parent_docs_map[parent_id])
+            else:
+                logger.warning(f"未找到 parent_id {parent_id} 对应的父文档对象")
+
+        logger.info(f"根据 {len(child_chunks)} 个子文档回溯得到 {len(parent_docs)} 个父文档")
+        return parent_docs
     @classmethod
     def get_category_labels(cls) -> list[str]:
         """
